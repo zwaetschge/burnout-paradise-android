@@ -1,0 +1,153 @@
+diff --git a/tools/lift/lift32.py b/tools/lift/lift32.py
+index 8b0d72a..a03fa7d 100644
+--- a/tools/lift/lift32.py
++++ b/tools/lift/lift32.py
+@@ -395,8 +395,13 @@ class Lifter:
+             return self._fmt_mem_write(op.mem, op.size, value)
+         return f"??? = {value}"
+ 
+-    def _fmt_mem_addr(self, mem) -> str:
+-        """Format the effective address calculation for a memory operand."""
++    def _fmt_mem_addr(self, mem, apply_segment=True) -> str:
++        """Format the effective address calculation for a memory operand.
++
++        `apply_segment` adds the fs/gs/es thread-relative base for a memory
++        access.  LEA computes only the effective address (the offset) and never
++        adds the segment base, so it passes apply_segment=False.
++        """
+         parts = []
+         if mem.base != 0:
+             parts.append(reg_name(mem.base))
+@@ -424,16 +429,17 @@ class Lifter:
+         # (the SEH chain head) reads the simulated TIB instead of VA 0.
+         # cs/ds/es/ss are flat in Win32 and need no base.
+         seg = getattr(mem, 'segment', 0)
+-        if seg == X86_REG_FS:
+-            return f"FS_BASE + ({addr})"
+-        if seg == X86_REG_GS:
+-            return f"GS_BASE + ({addr})"
+-        # Under a DOS extender es is a real selector: the startup code reads
+-        # the PSP and environment through it. ds/ss/cs stay flat (base 0).
+-        # ponytail: explicit es: overrides only; stos/movs still write flat
+-        # through edi, which holds while the program keeps es == ds for them.
+-        if seg == X86_REG_ES and self.dos:
+-            return f"ES_BASE + ({addr})"
++        if apply_segment:
++            if seg == X86_REG_FS:
++                return f"FS_BASE + ({addr})"
++            if seg == X86_REG_GS:
++                return f"GS_BASE + ({addr})"
++            # Under a DOS extender es is a real selector: the startup code reads
++            # the PSP and environment through it. ds/ss/cs stay flat (base 0).
++            # ponytail: explicit es: overrides only; stos/movs still write flat
++            # through edi, which holds while the program keeps es == ds for them.
++            if seg == X86_REG_ES and self.dos:
++                return f"ES_BASE + ({addr})"
+         return addr
+ 
+     def _fmt_mem_read(self, mem, size: int) -> str:
+@@ -463,8 +469,9 @@ class Lifter:
+         return f"MEM32({addr}) = {value}"
+ 
+     def _fmt_lea(self, mem) -> str:
+-        """Format LEA (just the address calculation, no memory access)."""
+-        return self._fmt_mem_addr(mem)
++        """Format LEA: the effective-address calculation only. LEA never adds
++        the segment base, so `lea edx, fs:[8]` yields 8, not FS_BASE + 8."""
++        return self._fmt_mem_addr(mem, apply_segment=False)
+ 
+     @staticmethod
+     def _string_cmp_base(insn, m):
+diff --git a/tools/lift/lift32_sse.py b/tools/lift/lift32_sse.py
+index 1b14aa3..dc5d8ed 100644
+--- a/tools/lift/lift32_sse.py
++++ b/tools/lift/lift32_sse.py
+@@ -44,6 +44,12 @@ SHIFTS = {'psrlw': ('u16', 16, 0), 'psrld': ('u32', 32, 0), 'psrlq': ('u64', 64,
+ PCMP = {'pcmpeqb': ('u8', '=='), 'pcmpeqw': ('u16', '=='), 'pcmpeqd': ('u32', '=='),
+         'pcmpgtb': ('i8', '>'), 'pcmpgtw': ('i16', '>'), 'pcmpgtd': ('i32', '>')}
+ _CT = {'u8': 'uint8_t', 'u16': 'uint16_t', 'u32': 'uint32_t', 'u64': 'uint64_t'}
++# padds*/psubs*/paddus*/psubus* on xmm: (signed, lane bits, operator).
++_SATURATING = {'paddsb': (1, 8, '+'), 'psubsb': (1, 8, '-'), 'paddsw': (1, 16, '+'), 'psubsw': (1, 16, '-'),
++               'paddusb': (0, 8, '+'), 'psubusb': (0, 8, '-'), 'paddusw': (0, 16, '+'), 'psubusw': (0, 16, '-')}
++# punpck{l,h}{bw,wd,dq} on xmm: (lane kind, lanes taken from each operand, first lane).
++_UNPACK = {'punpcklbw': ('u8', 8, 0), 'punpckhbw': ('u8', 8, 8), 'punpcklwd': ('u16', 4, 0),
++           'punpckhwd': ('u16', 4, 4), 'punpckldq': ('u32', 2, 0), 'punpckhdq': ('u32', 2, 2)}
+ 
+ 
+ def _xi(op):
+@@ -284,6 +290,75 @@ def lift_sse(L, m, ops, comment):
+     if m == 'cvtdq2pd':
+         return one(f"{{ int32_t _a = (int32_t){lane(s, 0, 'u32')}, _b = (int32_t){lane(s, 1, 'u32')}; "
+                    f"_xmm[{di}].f64[0] = _a; _xmm[{di}].f64[1] = _b; }}")
++    # ---- the rest of packed integer SSE2 (video/image code: IDCT, motion
++    # compensation, colour conversion) -----------------------------------------
++    if m in ('paddb', 'paddw', 'psubb', 'psubw') and di is not None:
++        k, n = ('u8', 16) if m.endswith('b') else ('u16', 8)
++        o = '+' if m.startswith('padd') else '-'
++        return one(f"{{ xmm_t _s = {X(s)}; for (int _k = 0; _k < {n}; _k++) "
++                   f"_xmm[{di}].{k}[_k] = ({_CT[k]})(_xmm[{di}].{k}[_k] {o} _s.{k}[_k]); }}")
++    if m in _SATURATING and di is not None:
++        signed, bits, o = _SATURATING[m]
++        n = 128 // bits
++        uk = f"u{bits}"
++        cast = f"(int{bits}_t)" if signed else ''
++        lo, hi = (-(1 << (bits - 1)), (1 << (bits - 1)) - 1) if signed else (0, (1 << bits) - 1)
++        return one(f"{{ xmm_t _s = {X(s)}; for (int _k = 0; _k < {n}; _k++) {{ "
++                   f"int32_t _v = (int32_t){cast}_xmm[{di}].{uk}[_k] {o} (int32_t){cast}_s.{uk}[_k]; "
++                   f"_xmm[{di}].{uk}[_k] = ({_CT[uk]})(_v < {lo} ? {lo} : (_v > {hi} ? {hi} : _v)); }} }}")
++    if m in ('pmullw', 'pmulhw', 'pmulhuw') and di is not None:
++        if m == 'pmulhuw':
++            body = f"_xmm[{di}].u16[_k] = (uint16_t)(((uint32_t)_xmm[{di}].u16[_k] * (uint32_t)_s.u16[_k]) >> 16);"
++        else:
++            sh = ' >> 16' if m == 'pmulhw' else ''
++            body = (f"_xmm[{di}].u16[_k] = (uint16_t)(((int32_t)_xmm[{di}].i16[_k] * "
++                    f"(int32_t)_s.i16[_k]){sh});")
++        return one(f"{{ xmm_t _s = {X(s)}; for (int _k = 0; _k < 8; _k++) {body} }}")
++    if m == 'pmuludq' and di is not None:
++        return one(f"{{ xmm_t _s = {X(s)}, _d = _xmm[{di}]; for (int _k = 0; _k < 2; _k++) "
++                   f"_xmm[{di}].u64[_k] = (uint64_t)_d.u32[_k * 2] * (uint64_t)_s.u32[_k * 2]; }}")
++    if m == 'pmaddwd' and di is not None:
++        return one(f"{{ xmm_t _s = {X(s)}, _d = _xmm[{di}]; for (int _k = 0; _k < 4; _k++) "
++                   f"_xmm[{di}].u32[_k] = (uint32_t)((int64_t)_d.i16[_k * 2] * _s.i16[_k * 2] + "
++                   f"(int64_t)_d.i16[_k * 2 + 1] * _s.i16[_k * 2 + 1]); }}")
++    if m in ('pavgb', 'pavgw') and di is not None:
++        k, n = ('u8', 16) if m == 'pavgb' else ('u16', 8)
++        return one(f"{{ xmm_t _s = {X(s)}; for (int _k = 0; _k < {n}; _k++) "
++                   f"_xmm[{di}].{k}[_k] = ({_CT[k]})(((uint32_t)_xmm[{di}].{k}[_k] + _s.{k}[_k] + 1u) >> 1); }}")
++    if m in ('pminub', 'pmaxub') and di is not None:
++        o = '<' if m == 'pminub' else '>'
++        return one(f"{{ xmm_t _s = {X(s)}; for (int _k = 0; _k < 16; _k++) "
++                   f"if (_s.u8[_k] {o} _xmm[{di}].u8[_k]) _xmm[{di}].u8[_k] = _s.u8[_k]; }}")
++    if m == 'psadbw' and di is not None:
++        return one(f"{{ xmm_t _s = {X(s)}, _d = _xmm[{di}]; for (int _h = 0; _h < 2; _h++) {{ uint32_t _t = 0; "
++                   f"for (int _k = 0; _k < 8; _k++) {{ int _v = (int)_d.u8[_h * 8 + _k] - (int)_s.u8[_h * 8 + _k]; "
++                   f"_t += (uint32_t)(_v < 0 ? -_v : _v); }} _xmm[{di}].u64[_h] = _t; }} }}")
++    if m in _UNPACK and di is not None:
++        k, n, off = _UNPACK[m]
++        return one(f"{{ xmm_t _s = {X(s)}, _d = _xmm[{di}]; for (int _k = 0; _k < {n}; _k++) {{ "
++                   f"_xmm[{di}].{k}[_k * 2] = _d.{k}[_k + {off}]; _xmm[{di}].{k}[_k * 2 + 1] = _s.{k}[_k + {off}]; }} }}")
++    if m in ('packsswb', 'packuswb') and di is not None:
++        lo, hi = (-128, 127) if m == 'packsswb' else (0, 255)
++        return one(f"{{ xmm_t _s = {X(s)}, _d = _xmm[{di}]; for (int _k = 0; _k < 8; _k++) {{ "
++                   f"int _a = _d.i16[_k], _b = _s.i16[_k]; "
++                   f"_xmm[{di}].u8[_k] = (uint8_t)(_a < {lo} ? {lo} : (_a > {hi} ? {hi} : _a)); "
++                   f"_xmm[{di}].u8[_k + 8] = (uint8_t)(_b < {lo} ? {lo} : (_b > {hi} ? {hi} : _b)); }} }}")
++    if m == 'packssdw' and di is not None:
++        return one(f"{{ xmm_t _s = {X(s)}, _d = _xmm[{di}]; for (int _k = 0; _k < 4; _k++) {{ "
++                   f"int32_t _a = _d.i32[_k], _b = _s.i32[_k]; "
++                   f"_xmm[{di}].u16[_k] = (uint16_t)(_a < -32768 ? -32768 : (_a > 32767 ? 32767 : _a)); "
++                   f"_xmm[{di}].u16[_k + 4] = (uint16_t)(_b < -32768 ? -32768 : (_b > 32767 ? 32767 : _b)); }} }}")
++    if m in ('pshuflw', 'pshufhw') and di is not None:
++        i = ops[2].imm
++        base = 0 if m == 'pshuflw' else 4
++        keep = 1 if m == 'pshuflw' else 0
++        return one(f"{{ xmm_t _s = {X(s)}; _xmm[{di}].u64[{keep}] = _s.u64[{keep}]; "
++                   + ' '.join(f"_xmm[{di}].u16[{base + j}] = _s.u16[{base + ((i >> (2 * j)) & 3)}];" for j in range(4))
++                   + " }")
++    if m == 'movdq2q' and _xi(s) is not None:
++        return one(f"{L._mm_write(d, f'_xmm[{_xi(s)}].u64[0]')};")
++    if m == 'movq2dq' and di is not None:
++        return one(f"{{ uint64_t _v = {L._mm_read(s)}; _xmm[{di}].u64[0] = _v; _xmm[{di}].u64[1] = 0; }}")
+     # Anything else with an xmm operand is counted, never handed back: lift32's
+     # MMX forms share these mnemonics (psrlq, pcmpeqd) and would lift the xmm
+     # register as "unknown reg", a silent wrong value instead of a counted gap.

@@ -1,0 +1,255 @@
+diff --git a/runtime/recomp32_cpu/cpu.h b/runtime/recomp32_cpu/cpu.h
+index a234400..479a685 100644
+--- a/runtime/recomp32_cpu/cpu.h
++++ b/runtime/recomp32_cpu/cpu.h
+@@ -71,7 +71,7 @@ typedef struct {
+     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
+     uint32_t eip;
+     /* flags as discrete bits (0/1) */
+-    uint32_t cf, zf, sf, of, pf, af;
++    uint32_t cf, zf, sf, of, pf, af, df;
+     /* x87: register-stack of doubles. st0 == st[fpu_top]; push pre-decrements. */
+     double   st[8];
+     int      fpu_top;
+@@ -185,11 +185,11 @@ static inline uint32_t atomic_xchg32(uint32_t a, uint32_t v) {
+ 
+ static inline uint32_t eflags_pack(CPU *c) {
+     return 0x202u | (c->cf) | (c->pf << 2) | (c->af << 4) |
+-           (c->zf << 6) | (c->sf << 7) | (c->of << 11);
++           (c->zf << 6) | (c->sf << 7) | (c->df << 10) | (c->of << 11);
+ }
+ static inline void eflags_unpack(CPU *c, uint32_t v) {
+     c->cf = v & 1; c->pf = (v >> 2) & 1; c->af = (v >> 4) & 1;
+-    c->zf = (v >> 6) & 1; c->sf = (v >> 7) & 1; c->of = (v >> 11) & 1;
++    c->zf = (v >> 6) & 1; c->sf = (v >> 7) & 1; c->of = (v >> 11) & 1; c->df = (v >> 10) & 1;
+ }
+ 
+ /* ---- stack ----
+@@ -225,10 +225,10 @@ static inline uint32_t parity8(uint8_t v) {
+ 
+ /* logical ops (AND/OR/XOR/TEST): CF=OF=0 */
+ static inline void flags_logic32(CPU *c, uint32_t r) {
+-    c->cf = 0; c->of = 0; c->sf = r >> 31; c->zf = (r == 0); c->pf = parity8((uint8_t)r);
++    c->cf = 0; c->of = 0; c->af = 0; c->sf = r >> 31; c->zf = (r == 0); c->pf = parity8((uint8_t)r);
+ }
+ static inline void flags_logic8(CPU *c, uint8_t r) {
+-    c->cf = 0; c->of = 0; c->sf = (r >> 7) & 1; c->zf = (r == 0); c->pf = parity8(r);
++    c->cf = 0; c->of = 0; c->af = 0; c->sf = (r >> 7) & 1; c->zf = (r == 0); c->pf = parity8(r);
+ }
+ /* cmp/sub (a - b) */
+ static inline uint32_t flags_sub32(CPU *c, uint32_t a, uint32_t b) {
+@@ -280,7 +280,7 @@ static inline uint32_t flags_add(CPU *c, uint32_t a, uint32_t b, int sz) {
+ }
+ static inline uint32_t flags_logicz(CPU *c, uint32_t r, int sz) {
+     uint32_t m = mask_sz(sz), s = sign_sz(sz); r &= m;
+-    c->cf = 0; c->of = 0; c->sf = (r & s) != 0; c->zf = (r == 0);
++    c->cf = 0; c->of = 0; c->af = 0; c->sf = (r & s) != 0; c->zf = (r == 0);
+     c->pf = parity8((uint8_t)r); return r;
+ }
+ static inline uint32_t flags_incs(CPU *c, uint32_t a, int sz) {
+@@ -305,20 +305,32 @@ static inline uint32_t flags_sbb(CPU *c, uint32_t a, uint32_t b, int sz) {
+ }
+ 
+ static inline uint32_t op_shl(CPU *c, uint32_t v, uint32_t cnt, int sz) {
+-    uint32_t m = mask_sz(sz); cnt &= 31; if (!cnt) return v & m;
+-    c->cf = (v >> (sz * 8 - cnt)) & 1; uint32_t r = (v << cnt) & m;
+-    c->zf = (r == 0); c->sf = (r & sign_sz(sz)) != 0; c->pf = parity8((uint8_t)r); return r;
++    uint32_t m = mask_sz(sz), w = (uint32_t)sz * 8; v &= m;
++    cnt &= 31; if (!cnt) return v;
++    c->cf = cnt <= w ? (v >> (w - cnt)) & 1 : 0;
++    uint32_t r = (v << cnt) & m;
++    c->zf = (r == 0); c->sf = (r & sign_sz(sz)) != 0; c->pf = parity8((uint8_t)r);
++    uint32_t previous = (v << (cnt - 1)) & m;
++    c->of = ((previous ^ r) & sign_sz(sz)) != 0;
++    c->af = 0; return r;
+ }
+ static inline uint32_t op_shr(CPU *c, uint32_t v, uint32_t cnt, int sz) {
+     uint32_t m = mask_sz(sz); v &= m; cnt &= 31; if (!cnt) return v;
+     c->cf = (v >> (cnt - 1)) & 1; uint32_t r = v >> cnt;
+-    c->zf = (r == 0); c->sf = (r & sign_sz(sz)) != 0; c->pf = parity8((uint8_t)r); return r;
++    c->zf = (r == 0); c->sf = (r & sign_sz(sz)) != 0; c->pf = parity8((uint8_t)r);
++    uint32_t previous = v >> (cnt - 1);
++    c->of = ((previous ^ r) & sign_sz(sz)) != 0;
++    c->af = 0; return r;
+ }
+ static inline uint32_t op_sar(CPU *c, uint32_t v, uint32_t cnt, int sz) {
+     uint32_t m = mask_sz(sz), s = sign_sz(sz); v &= m; cnt &= 31; if (!cnt) return v;
+-    uint32_t ext = (v & s) ? (m << (sz * 8 - cnt)) & m : 0;
+-    c->cf = (v >> (cnt - 1)) & 1; uint32_t r = ((v >> cnt) | ext) & m;
+-    c->zf = (r == 0); c->sf = (r & s) != 0; c->pf = parity8((uint8_t)r); return r;
++    if (v & s) v |= ~m;
++    c->cf = (v >> (cnt - 1)) & 1;
++    uint32_t ext = (v & s) ? (~0u << (32 - cnt)) : 0;
++    uint32_t r = ((v >> cnt) | ext) & m;
++    c->zf = (r == 0); c->sf = (r & s) != 0; c->pf = parity8((uint8_t)r);
++    c->of = 0; /* also the pinned oracle choice for multi-bit SAR */
++    c->af = 0; return r;
+ }
+ 
+ /* ---- rotates. Unlike the shifts these leave ZF/SF/PF alone, which is not an
+@@ -363,6 +375,11 @@ static inline uint32_t op_shld(CPU *c, uint32_t d, uint32_t s, uint32_t cnt, int
+     uint32_t r = ((d << cnt) | (s >> (w - cnt))) & m;
+     c->cf = (d >> (w - cnt)) & 1;
+     c->zf = (r == 0); c->sf = (r & sign_sz(sz)) != 0; c->pf = parity8((uint8_t)r);
++    /* Defined for count1; select the same deterministic OF/AF as
++     * the Unicorn reference for architecturally undefined larger counts. */
++    uint64_t pair = ((uint64_t)d << w) | s;
++    uint32_t previous = (uint32_t)((pair << (cnt - 1)) >> w) & m;
++    c->of = ((previous ^ r) & sign_sz(sz)) != 0; c->af = 0;
+     return r;
+ }
+ /* BSF/BSR: the index of the lowest (or highest) set bit. The flag is the
+@@ -408,34 +425,32 @@ static inline uint32_t op_bittest(CPU *c, uint32_t d, uint32_t bit, int sz, int
+ static inline uint32_t op_rcl(CPU *c, uint32_t d, uint32_t cnt, int sz) {
+     uint32_t n = (uint32_t)sz * 8, i;
+     uint32_t mask = (n == 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+-    cnt %= (n + 1);
+-    if (cnt == 0) return d;        /* a zero count changes no flag at all */
++    cnt &= 31; cnt %= (n + 1);
++    if (cnt == 0) return d;
++    uint32_t original = d & mask;
+     for (i = 0; i < cnt; i++) {
+         uint32_t top = (d >> (n - 1)) & 1u;
+         d = ((d << 1) | c->cf) & mask;
+         c->cf = top;
+     }
+-    /* OF is defined only for a count of one; hardware leaves something there
+-     * for the rest and nothing may read it. */
+-    if (cnt == 1) c->of = (uint32_t)(((d >> (n - 1)) & 1u) ^ c->cf);
++    /* Count1 is architectural. For larger counts, choose the pinned
++     * reference's old/new-sign OF so subsequent SETcc is deterministic. */
++    c->of = ((original ^ d) >> (n - 1)) & 1u;
+     return d;
+ }
+ 
+ static inline uint32_t op_rcr(CPU *c, uint32_t d, uint32_t cnt, int sz) {
+     uint32_t n = (uint32_t)sz * 8, i;
+     uint32_t mask = (n == 32) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+-    cnt %= (n + 1);
++    cnt &= 31; cnt %= (n + 1);
+     if (cnt == 0) return d;
+-    /* RCR sets OF from the two top bits of the RESULT, and before the rotate
+-     * rather than after - but only the count-of-one case is defined, and for
+-     * that one the two are the same thing. */
+-    if (cnt == 1) c->of = (uint32_t)((((d >> 1) | (c->cf << (n - 1))) >> (n - 1)) & 1u)
+-                        ^ (uint32_t)((((d >> 1) | (c->cf << (n - 1))) >> (n - 2)) & 1u);
++    uint32_t original = d & mask;
+     for (i = 0; i < cnt; i++) {
+         uint32_t bot = d & 1u;
+         d = ((d >> 1) | (c->cf << (n - 1))) & mask;
+         c->cf = bot;
+     }
++    c->of = ((original ^ d) >> (n - 1)) & 1u;
+     return d;
+ }
+ 
+@@ -446,6 +461,11 @@ static inline uint32_t op_shrd(CPU *c, uint32_t d, uint32_t s, uint32_t cnt, int
+     uint32_t r = ((d >> cnt) | (s << (w - cnt))) & m;
+     c->cf = (d >> (cnt - 1)) & 1;
+     c->zf = (r == 0); c->sf = (r & sign_sz(sz)) != 0; c->pf = parity8((uint8_t)r);
++    /* Defined for count1; select the same deterministic OF/AF as
++     * the Unicorn reference for architecturally undefined larger counts. */
++    uint64_t pair = ((uint64_t)s << w) | d;
++    uint32_t previous = (uint32_t)(pair >> (cnt - 1)) & m;
++    c->of = ((previous ^ r) & sign_sz(sz)) != 0; c->af = 0;
+     return r;
+ }
+ 
+diff --git a/tools/lift/lift32_cpu.py b/tools/lift/lift32_cpu.py
+index b62b2d3..dcf4210 100644
+--- a/tools/lift/lift32_cpu.py
++++ b/tools/lift/lift32_cpu.py
+@@ -376,6 +376,13 @@ class Lifter:
+         if op.type == X86_OP_REG: return reg_read(self.md.reg_name(op.reg))
+         if op.type == X86_OP_IMM:
+             sz = op.size
++            if sz == 0:
++                # Capstone 5 exposes D0/D1's implicit count-one as imm=1,
++                # size=0 on memory rotates. It is not a zero-bit integer.
++                if (insn.mnemonic in ("rcl", "rcr", "rol", "ror", "shl", "sal", "shr", "sar")
++                        and op.imm == 1 and insn.opcode[0] in (0xD0, 0xD1)):
++                    return "1u"
++                raise ValueError(f"unsupported zero-width immediate at 0x{insn.address:08X}")
+             mask = {1:0xFF,2:0xFFFF,4:0xFFFFFFFF}[sz]
+             v = op.imm & mask
+             # a 4-byte immediate sitting at a relocated VA is an absolute address
+@@ -422,6 +429,11 @@ class Lifter:
+             if d.type == X86_OP_MEM:
+                 return ["bit_string_op(c, %s, (int32_t)(%s), %d);"
+                         % (self.addr_expr(insn, d), idx, opnum)]
++            if d.size == 2:
++                return ["{ uint32_t _v = %s, _idx = (uint32_t)(%s) & 15u;"
++                        % (self._read_dst(insn, d), idx),
++                        "  bit_reg_op(c, &_v, _idx, %d);" % opnum,
++                        "  " + self.dst_write(insn, d, "_v") + " }"]
+             return ["bit_reg_op(c, &c->%s, %s, %d);"
+                     % (self.md.reg_name(d.reg), idx, opnum)]
+ 
+@@ -513,6 +525,20 @@ class Lifter:
+             if d.size == 4:
+                 return [self.dst_write(insn, d,
+                                        f"op_bswap32({self._read_dst(insn, d)})")]
++        if m == "lzcnt":
++            d, s = two()
++            if d.type == X86_OP_REG and d.size in (2, 4) and s.size == d.size:
++                bits = d.size * 8
++                # Capture before writing the destination, including aliasing
++                # register/address operands. No clz(0) or signed-shift UB.
++                return [f"{{ uint32_t _lzv = (uint{bits}_t)({self.src(insn,s)});"
++                        f" uint32_t _lzr = {bits};"
++                        f" if (_lzv) {{ _lzr = 0; while (!(_lzv & (1u << {bits-1})))"
++                        " { ++_lzr; _lzv <<= 1; } }"
++                        f" c->cf = (_lzr == {bits}); c->zf = (_lzr == 0);"
++                        # Undefined flags follow the pinned Unicorn policy.
++                        " c->of = c->sf = c->af = c->pf = 0; "
++                        + self.dst_write(insn,d,"_lzr") + " }"]
+         if m in ("bsf", "bsr"):
+             d, src = ops[0], ops[1]
+             fn = "op_bsf" if m == "bsf" else "op_bsr"
+@@ -595,8 +621,11 @@ class Lifter:
+         if m == "popf":   return ["eflags_unpack(c, pop32(c) & 0xFFFFu);"]
+         if m in ("cbw",):  return ["SET16(c->eax, (uint16_t)(int16_t)(int8_t)R8L(c->eax));"]
+         if m in ("cwd",):  return ["SET16(c->edx, (R16(c->eax) & 0x8000u) ? 0xFFFFu : 0u);"]
+-        if m in ("wait","fwait","nop","int3","cld","fnop","hint_nop"): return [f"/* {m} */"]
+-        if m == "std": return ["/* std (DF=1 unsupported; string ops assume forward) */"]
++        if m in ("wait","fwait","nop","int3","fnop","hint_nop"): return [f"/* {m} */"]
++        if m == "clc": return ["c->cf = 0;"]
++        if m == "stc": return ["c->cf = 1;"]
++        if m == "cld": return ["c->df = 0;"]
++        if m == "std": return ["c->df = 1;"]
+         if m == "enter":
+             n = ops[0].imm if ops else 0
+             return [f"push32(c, c->ebp); c->ebp = c->esp; c->esp -= {n};"]
+@@ -637,7 +666,7 @@ class Lifter:
+             if sg: return [f"{{ int16_t _n=(int16_t)R16(c->eax); int8_t _d=(int8_t)({v}); SET8L(c->eax,(uint8_t)(int8_t)(_n/_d)); SET8H(c->eax,(uint8_t)(int8_t)(_n%_d)); }}"]
+             return [f"{{ uint16_t _n=R16(c->eax); uint8_t _d=(uint8_t)({v}); SET8L(c->eax,_n/_d); SET8H(c->eax,_n%_d); }}"]
+ 
+-        # string ops (assume DF=0 / forward; rep prefix loops on ECX)
++        # string ops (DF selects unsigned forward/backward step; REP loops on ECX)
+         parts = m.split()
+         # An F3 prefix is only a REP on a string instruction. On anything else
+         # it is a hint, and the one that matters is `repz ret` (F3 C3) - AMD's
+@@ -653,17 +682,18 @@ class Lifter:
+             base = parts[1] if rep else parts[0]
+             esz = {"b":1,"w":2,"d":4}[base[-1]]
+             wfn = {1:"wr8",2:"wr16",4:"wr32"}[esz]; rfn = {1:"rd8",2:"rd16",4:"rd32"}[esz]
++            step = f"(c->df ? (0u - {esz}u) : {esz}u)"
+             areg = {1:"R8L(c->eax)",2:"R16(c->eax)",4:"c->eax"}[esz]
+-            if base.startswith("stos"): body = f"{wfn}(c->edi, {areg}); c->edi += {esz};"
+-            elif base.startswith("movs"): body = f"{wfn}(c->edi, {rfn}(c->esi)); c->esi += {esz}; c->edi += {esz};"
+-            elif base.startswith("lods"): body = f"{('SET8L(c->eax,'+rfn+'(c->esi))') if esz==1 else (('SET16(c->eax,'+rfn+'(c->esi))') if esz==2 else 'c->eax = '+rfn+'(c->esi)')}; c->esi += {esz};"
++            if base.startswith("stos"): body = f"{wfn}(c->edi, {areg}); c->edi += {step};"
++            elif base.startswith("movs"): body = f"{wfn}(c->edi, {rfn}(c->esi)); c->esi += {step}; c->edi += {step};"
++            elif base.startswith("lods"): body = f"{('SET8L(c->eax,'+rfn+'(c->esi))') if esz==1 else (('SET16(c->eax,'+rfn+'(c->esi))') if esz==2 else 'c->eax = '+rfn+'(c->esi)')}; c->esi += {step};"
+             elif base.startswith("scas"):
+-                cmp = f"flags_sub(c, {areg}, {rfn}(c->edi), {esz}); c->edi += {esz};"
++                cmp = f"flags_sub(c, {areg}, {rfn}(c->edi), {esz}); c->edi += {step};"
+                 if rep in ("repe","repz"):  return [f"while (c->ecx) {{ c->ecx--; {cmp} if (!c->zf) break; }}"]
+                 if rep in ("repne","repnz"):return [f"while (c->ecx) {{ c->ecx--; {cmp} if (c->zf) break; }}"]
+                 return [cmp]
+             elif base.startswith("cmps"):
+-                cmp = f"flags_sub(c, {rfn}(c->esi), {rfn}(c->edi), {esz}); c->esi += {esz}; c->edi += {esz};"
++                cmp = f"flags_sub(c, {rfn}(c->esi), {rfn}(c->edi), {esz}); c->esi += {step}; c->edi += {step};"
+                 if rep in ("repe","repz"):  return [f"while (c->ecx) {{ c->ecx--; {cmp} if (!c->zf) break; }}"]
+                 if rep in ("repne","repnz"):return [f"while (c->ecx) {{ c->ecx--; {cmp} if (c->zf) break; }}"]
+                 return [cmp]

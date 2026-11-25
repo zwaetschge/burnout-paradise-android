@@ -1,0 +1,8 @@
+# Meson native file: headless DXVK d3d9 for the x86-64 capture run (no display;
+# the patch's Android WSI runs on VK_EXT_headless_surface, frames are read back).
+[binaries]
+pkg-config = '/bin/false'
+glslang  = 'glslangValidator'
+
+[properties]
+dxvk_headless_wsi = true

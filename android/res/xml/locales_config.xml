@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The 14 languages Burnout Paradise: The Ultimate Box ships text for
+     (LANGUAGE/0001..0014.BUNDLE; image 0x008388D0 keeps exactly these).
+     Android 13+ offers them under Settings -> Apps -> Burnout -> Language;
+     the choice applies at the next start of the game. -->
+<locale-config xmlns:android="http://schemas.android.com/apk/res/android">
+    <locale android:name="en-US" />
+    <locale android:name="en-GB" />
+    <locale android:name="de" />
+    <locale android:name="fr" />
+    <locale android:name="it" />
+    <locale android:name="es" />
+    <locale android:name="pl" />
+    <locale android:name="cs" />
+    <locale android:name="hu" />
+    <locale android:name="ru" />
+    <locale android:name="pt-PT" />
+    <locale android:name="zh-CN" />
+    <locale android:name="zh-TW" />
+    <locale android:name="th" />
+</locale-config>

@@ -1,0 +1,17 @@
+diff --git a/tools/lift/lift32.py b/tools/lift/lift32.py
+index 16ada94..8b0d72a 100644
+--- a/tools/lift/lift32.py
++++ b/tools/lift/lift32.py
+@@ -1037,10 +1037,10 @@ class Lifter:
+                     lines.append("  SET_LO16(eax, _d ? (((uint32_t)(_n % _d) & 0xFFu) << 8)"
+                                  " | ((uint32_t)(_n / _d) & 0xFFu) : 0u); }")
+                 elif w == 2 and m == 'div':
+-                    lines.append(f"{{ uint32_t _n = (LO16(edx) << 16) | LO16(eax), _d = (uint16_t)({divisor}); {comment}")
++                    lines.append(f"{{ uint32_t _n = ((uint32_t)LO16(edx) << 16) | LO16(eax), _d = (uint16_t)({divisor}); {comment}")
+                     lines.append("  SET_LO16(eax, _d ? _n / _d : 0u); SET_LO16(edx, _d ? _n % _d : 0u); }")
+                 elif w == 2:
+-                    lines.append(f"{{ int32_t _n = (int32_t)((LO16(edx) << 16) | LO16(eax)), _d = (int16_t)({divisor}); {comment}")
++                    lines.append(f"{{ int32_t _n = (int32_t)(((uint32_t)LO16(edx) << 16) | LO16(eax)), _d = (int16_t)({divisor}); {comment}")
+                     lines.append("  int _ok = _d && !(_d == -1 && _n == INT32_MIN);")
+                     lines.append("  SET_LO16(eax, _ok ? (uint32_t)(_n / _d) : 0u); SET_LO16(edx, _ok ? (uint32_t)(_n % _d) : 0u); }")
+                 elif m == 'div':

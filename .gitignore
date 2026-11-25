@@ -1,0 +1,31 @@
+# Local build outputs & caches (never commit)
+work/
+out/
+mods/
+third_party/
+__pycache__/
+*.py[cod]
+
+# Private / copyrighted game files & everything derived from them
+*.apk
+*.idsig
+*.so
+*.o
+*.a
+*.exe
+*.dll
+*.cab
+*.nls
+*.bin
+*.bundle
+*.bndl
+*.dat
+*.dxcq
+*.dxcr
+*.keystore
+*.jks
+*.pem
+*.key
+*.pk8
+*.log
+.DS_Store

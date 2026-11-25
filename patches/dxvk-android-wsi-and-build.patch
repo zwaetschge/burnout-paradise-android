@@ -1,0 +1,1018 @@
+diff --git a/include/native/headless/android/native_window.h b/include/native/headless/android/native_window.h
+new file mode 100644
+index 0000000..a4c9b30
+--- /dev/null
++++ b/include/native/headless/android/native_window.h
+@@ -0,0 +1,31 @@
++#pragma once
++/* Host stand-in for the NDK's <android/native_window.h>, used only by the
++ * headless WSI build (DXVK_WSI_HEADLESS): the "window" is a size record owned
++ * by the embedding application and the Vulkan surface is a
++ * VK_EXT_headless_surface. No pixels are ever shown. */
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++typedef struct ANativeWindow {
++  int32_t width;
++  int32_t height;
++  int32_t format;
++} ANativeWindow;
++static inline int32_t ANativeWindow_getWidth(ANativeWindow* window) {
++  return window ? window->width : -1;
++}
++static inline int32_t ANativeWindow_getHeight(ANativeWindow* window) {
++  return window ? window->height : -1;
++}
++static inline int32_t ANativeWindow_setBuffersGeometry(
++    ANativeWindow* window, int32_t width, int32_t height, int32_t format) {
++  if (!window) return -1;
++  if (width > 0)  window->width = width;
++  if (height > 0) window->height = height;
++  if (format)     window->format = format;
++  return 0;
++}
++#ifdef __cplusplus
++}
++#endif
+diff --git a/include/native/meson.build b/include/native/meson.build
+index ca49309..fe5802d 100644
+--- a/include/native/meson.build
++++ b/include/native/meson.build
+@@ -16,5 +16,6 @@ install_headers(
+   'wsi/native_sdl3.h',
+   'wsi/native_sdl2.h',
+   'wsi/native_glfw.h',
++  'wsi/native_android.h',
+   subdir: 'dxvk/wsi',
+ )
+diff --git a/include/native/wsi/native_android.h b/include/native/wsi/native_android.h
+new file mode 100644
+index 0000000..6320760
+--- /dev/null
++++ b/include/native/wsi/native_android.h
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include <windows.h>
++
++#include <android/native_window.h>
++
++namespace dxvk::wsi {
++
++  // On Android the "window handle" handed to DXVK is the ANativeWindow of the
++  // Activity's Surface. DXVK never dereferences it itself, it only hands it to
++  // the WSI driver, so a plain pointer cast is enough.
++  inline ANativeWindow* fromHwnd(HWND hWindow) {
++    return reinterpret_cast<ANativeWindow*>(hWindow);
++  }
++
++  inline HWND toHwnd(ANativeWindow* pWindow) {
++    return reinterpret_cast<HWND>(pWindow);
++  }
++
++  // Android exposes exactly one (default) display, id 0. Offset by one so that
++  // display 0 maps to a non-null HMONITOR and "no monitor" (nullptr) maps to
++  // -1, matching the convention used by the SDL3 backend.
++  inline int32_t fromHmonitor(HMONITOR hMonitor) {
++    return int32_t(intptr_t(hMonitor)) - 1;
++  }
++
++  inline HMONITOR toHmonitor(int32_t displayId) {
++    return reinterpret_cast<HMONITOR>(intptr_t(displayId + 1));
++  }
++
++}
+diff --git a/include/native/wsi/native_wsi.h b/include/native/wsi/native_wsi.h
+index e5d7321..b5442b5 100644
+--- a/include/native/wsi/native_wsi.h
++++ b/include/native/wsi/native_wsi.h
+@@ -8,6 +8,8 @@
+ #include "wsi/native_sdl2.h"
+ #elif DXVK_WSI_GLFW
+ #include "wsi/native_glfw.h"
++#elif DXVK_WSI_ANDROID
++#include "wsi/native_android.h"
+ #else
+ #error Unknown wsi!
+ #endif
+\ No newline at end of file
+diff --git a/meson.build b/meson.build
+index 4964301..7ad4878 100644
+--- a/meson.build
++++ b/meson.build
+@@ -149,29 +149,56 @@ else
+     './include/native/directx'
+   ]
+ 
+-  lib_sdl3 = dependency('sdl3', required: get_option('native_sdl3'))
+-  lib_sdl2 = dependency('sdl2', required: get_option('native_sdl2'))
+-  lib_glfw = dependency('glfw3', required: get_option('native_glfw'))
+-  if lib_sdl3.found()
+-    compiler_args += ['-DDXVK_WSI_SDL3']
+-  endif
+-  if lib_sdl2.found()
+-    compiler_args += ['-DDXVK_WSI_SDL2']
+-  endif
+-  if lib_glfw.found()
+-    compiler_args += ['-DDXVK_WSI_GLFW']
+-  endif
+-  if (not lib_sdl3.found() and not lib_sdl2.found() and not lib_glfw.found())
+-    error('SDL3, SDL2, or GLFW are required to build dxvk-native')
+-  endif
+-  
+   dxvk_name_prefix = 'dxvk_'
+   dxvk_pkg_prefix = 'dxvk-'
+ 
+-  link_args += [
+-    '-static-libgcc',
+-    '-static-libstdc++',
+-  ]
++  # Host builds without a window system (software Vulkan, CI): the Android WSI
++  # driver is reused on top of a tiny ANativeWindow stand-in
++  # (include/native/headless) and VK_EXT_headless_surface. Enabled with
++  # `dxvk_headless_wsi = true` in the [properties] of the machine file.
++  headless_wsi = meson.get_external_property('dxvk_headless_wsi', false)
++
++  if platform == 'android' or headless_wsi
++    # DXVK Native on Android: the WSI is implemented directly on top of
++    # ANativeWindow (src/wsi/android) instead of SDL/GLFW, so no window system
++    # library is required. libandroid provides ANativeWindow_*.
++    lib_sdl3 = dependency('', required : false)
++    lib_sdl2 = dependency('', required : false)
++    lib_glfw = dependency('', required : false)
++    if headless_wsi
++      compiler_args += ['-DDXVK_WSI_HEADLESS']
++      dxvk_include_dirs += ['./include/native/headless']
++    else
++      lib_android = cpp.find_library('android')
++      # src/util/log/log.cpp writes to logcat on Android.
++      link_args += ['-llog']
++    endif
++    compiler_args += ['-DDXVK_WSI_ANDROID']
++    # Android uses the platform libc++ (libc++_shared.so); the static libgcc /
++    # libstdc++ flags of the desktop dxvk-native build do not apply.
++    dxvk_so_version = {}
++  else
++    lib_sdl3 = dependency('sdl3', required: get_option('native_sdl3'))
++    lib_sdl2 = dependency('sdl2', required: get_option('native_sdl2'))
++    lib_glfw = dependency('glfw3', required: get_option('native_glfw'))
++    if lib_sdl3.found()
++      compiler_args += ['-DDXVK_WSI_SDL3']
++    endif
++    if lib_sdl2.found()
++      compiler_args += ['-DDXVK_WSI_SDL2']
++    endif
++    if lib_glfw.found()
++      compiler_args += ['-DDXVK_WSI_GLFW']
++    endif
++    if (not lib_sdl3.found() and not lib_sdl2.found() and not lib_glfw.found())
++      error('SDL3, SDL2, or GLFW are required to build dxvk-native')
++    endif
++
++    link_args += [
++      '-static-libgcc',
++      '-static-libstdc++',
++    ]
++  endif
+ endif
+ 
+ dxbc_spirv = subproject('dxbc-spirv')
+diff --git a/src/d3d11/d3d11.sym b/src/d3d11/d3d11.sym
+index 91c8598..9ab9789 100644
+--- a/src/d3d11/d3d11.sym
++++ b/src/d3d11/d3d11.sym
+@@ -1,5 +1,6 @@
+ {
+   global:
++    dxvk_android_wsi_set_display_metrics;
+     D3D11CoreCreateDevice;
+     D3D11CreateDevice;
+     D3D11CreateDeviceAndSwapChain;
+diff --git a/src/d3d9/d3d9.sym b/src/d3d9/d3d9.sym
+index bbfaee0..82d1d19 100644
+--- a/src/d3d9/d3d9.sym
++++ b/src/d3d9/d3d9.sym
+@@ -1,5 +1,6 @@
+ {
+   global:
++    dxvk_android_wsi_set_display_metrics;
+     Direct3DCreate9;
+     Direct3DCreate9Ex;
+     D3DPERF_BeginEvent;
+diff --git a/src/dxgi/dxgi.sym b/src/dxgi/dxgi.sym
+index d527d64..7342db8 100644
+--- a/src/dxgi/dxgi.sym
++++ b/src/dxgi/dxgi.sym
+@@ -1,5 +1,6 @@
+ {
+   global:
++    dxvk_android_wsi_set_display_metrics;
+     CreateDXGIFactory2;
+     CreateDXGIFactory1;
+     CreateDXGIFactory;
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index 63d89d9..30d5d71 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -5,6 +5,7 @@
+ #include <type_traits>
+ 
+ #include "dxvk_device_info.h"
++#include "../util/util_env.h"
+ #include "dxvk_instance.h"
+ #include "dxvk_limits.h"
+ 
+@@ -615,6 +616,17 @@ namespace dxvk {
+     if (!m_featuresSupported.khrPresentId.presentId)
+       m_featuresSupported.khrPresentWait.presentWait = VK_FALSE;
+ 
++#ifdef __ANDROID__
++    // Port switch (burnout-paradise-android): DXVK_PORT_NO_PRESENT_WAIT=1 makes
++    // the presenter signal frames after vkQueuePresentKHR instead of waiting
++    // for the driver to report them as displayed (vkWaitForPresentKHR).
++    if (env::getEnvVar("DXVK_PORT_NO_PRESENT_WAIT") == "1") {
++      Logger::info("Port: present wait disabled (DXVK_PORT_NO_PRESENT_WAIT=1)");
++      m_featuresSupported.khrPresentWait.presentWait = VK_FALSE;
++      m_featuresSupported.khrPresentWait2.presentWait2 = VK_FALSE;
++    }
++#endif
++
+     if (!m_featuresSupported.khrPresentId.presentId
+      && !m_featuresSupported.khrPresentId2.presentId2)
+       m_featuresSupported.nvLowLatency2 = VK_FALSE;
+diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
+index f93ae8d..1da04f3 100644
+--- a/src/dxvk/dxvk_presenter.cpp
++++ b/src/dxvk/dxvk_presenter.cpp
+@@ -78,6 +78,21 @@ namespace dxvk {
+   }
+ 
+ 
++
++#ifdef __ANDROID__
++  // Port (Android): a landscape app on a panel whose natural orientation is
++  // portrait gets VK_SUBOPTIMAL_KHR from every acquire and present, because
++  // the swap chain is created with an identity pre-transform and the
++  // compositor rotates it. That state does not change by recreating the swap
++  // chain, so recreating it (as below, on every frame) only costs time. The
++  // image is presentable: treat the result as success.
++  static inline VkResult portAcceptSuboptimal(VkResult vr) {
++    return vr == VK_SUBOPTIMAL_KHR ? VK_SUCCESS : vr;
++  }
++#else
++  static inline VkResult portAcceptSuboptimal(VkResult vr) { return vr; }
++#endif
++
+   VkResult Presenter::acquireNextImage(PresenterSync& sync, Rc<DxvkImage>& image) {
+     std::unique_lock lock(m_surfaceMutex);
+ 
+@@ -103,9 +118,9 @@ namespace dxvk {
+ 
+       waitForSwapchainFence(sync);
+ 
+-      m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
++      m_acquireStatus = portAcceptSuboptimal(m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+         m_swapchain, std::numeric_limits<uint64_t>::max(),
+-        sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++        sync.acquire, VK_NULL_HANDLE, &m_imageIndex));
+     }
+ 
+     // This is a normal occurence, but may be useful for
+@@ -127,9 +142,9 @@ namespace dxvk {
+ 
+       PresenterSync sync = m_semaphores.at(m_frameIndex);
+ 
+-      m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
++      m_acquireStatus = portAcceptSuboptimal(m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+         m_swapchain, std::numeric_limits<uint64_t>::max(),
+-        sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++        sync.acquire, VK_NULL_HANDLE, &m_imageIndex));
+ 
+       if (m_acquireStatus < 0) {
+         Logger::info(str::format("Presenter: Got ", m_acquireStatus, " from fresh swapchain"));
+@@ -224,8 +239,8 @@ namespace dxvk {
+     if (m_hasIncrementalPresent && !m_presentRepaint && m_acquireStatus == VK_SUCCESS && rectCount)
+       regionInfo.pNext = const_cast<void*>(std::exchange(info.pNext, &regionInfo));
+ 
+-    VkResult status = m_vkd->vkQueuePresentKHR(
+-      m_device->queues().graphics.queueHandle, &info);
++    VkResult status = portAcceptSuboptimal(m_vkd->vkQueuePresentKHR(
++      m_device->queues().graphics.queueHandle, &info));
+ 
+     // Maintain valid state if presentation succeeded, even if we want to
+     // recreate the swapchain. Spec says that 'queue' operations, i.e. the
+@@ -266,9 +281,9 @@ namespace dxvk {
+       PresenterSync& nextSync = m_semaphores.at(m_frameIndex);
+       waitForSwapchainFence(nextSync);
+ 
+-      m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
++      m_acquireStatus = portAcceptSuboptimal(m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
+         m_swapchain, std::numeric_limits<uint64_t>::max(),
+-        nextSync.acquire, VK_NULL_HANDLE, &m_imageIndex);
++        nextSync.acquire, VK_NULL_HANDLE, &m_imageIndex));
+     }
+ 
+     // Recreate the swapchain on the next acquire, even if we get suboptimal.
+diff --git a/src/util/log/log.cpp b/src/util/log/log.cpp
+index 5158cd7..be4676e 100644
+--- a/src/util/log/log.cpp
++++ b/src/util/log/log.cpp
+@@ -4,6 +4,10 @@
+ 
+ #include "../util_env.h"
+ 
++#ifdef __ANDROID__
++#include <android/log.h>
++#endif
++
+ namespace dxvk {
+   
+   Logger::Logger(const std::string& fileName)
+@@ -106,6 +110,9 @@ namespace dxvk {
+           // Don't log anything to stderr if we're not on wine. Usually games are
+           // compiled as gui apps anyway, and emitting anything to the standard
+           // output streams can crash certain games.
++#elif defined(__ANDROID__)
++          // Android app processes have no usable stderr; use logcat.
++          __android_log_print(ANDROID_LOG_INFO, "DXVK", "%s", adjusted.c_str());
+ #else
+           // For native builds, logging to stderr should be fine.
+           std::cerr << adjusted;
+diff --git a/src/util/util_math.h b/src/util/util_math.h
+index 9276d93..a712940 100644
+--- a/src/util/util_math.h
++++ b/src/util/util_math.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <cmath>
++#include <cstddef>
+ 
+ namespace dxvk {
+   
+diff --git a/src/vulkan/vulkan_loader.h b/src/vulkan/vulkan_loader.h
+index 8ad6478..8164089 100644
+--- a/src/vulkan/vulkan_loader.h
++++ b/src/vulkan/vulkan_loader.h
+@@ -3,7 +3,15 @@
+ #include "../util/rc/util_rc.h"
+ #include "../util/rc/util_rc_ptr.h"
+ 
++// DXVK's native build still references the Win32 external-memory / keyed-mutex
++// / fullscreen-exclusive extension names (dxvk_device_info.h), so the Win32
++// platform header stays enabled. Android additionally needs the ANativeWindow
++// surface platform. vulkan_win32.h also pulls in <windows.h>, which this header
++// relies on for HMODULE.
+ #define VK_USE_PLATFORM_WIN32_KHR 1
++#if defined(__ANDROID__)
++#define VK_USE_PLATFORM_ANDROID_KHR 1
++#endif
+ #include <vulkan/vulkan.h>
+ 
+ #define VULKAN_FN(name) \
+diff --git a/src/wsi/android/wsi_monitor_android.cpp b/src/wsi/android/wsi_monitor_android.cpp
+new file mode 100644
+index 0000000..259496c
+--- /dev/null
++++ b/src/wsi/android/wsi_monitor_android.cpp
+@@ -0,0 +1,117 @@
++#if defined(DXVK_WSI_ANDROID)
++
++#include "../wsi_monitor.h"
++
++#include "native/wsi/native_android.h"
++#include "wsi_platform_android.h"
++
++#include "../../util/util_string.h"
++#include "../../util/log/log.h"
++
++#include <windows.h>
++
++namespace dxvk::wsi {
++
++  HMONITOR AndroidWsiDriver::getDefaultMonitor() {
++    return enumMonitors(0);
++  }
++
++
++  HMONITOR AndroidWsiDriver::enumMonitors(uint32_t index) {
++    // Android has exactly one default display.
++    return index == 0 ? toHmonitor(0) : nullptr;
++  }
++
++
++  HMONITOR AndroidWsiDriver::enumMonitors(const LUID *adapterLUID[], uint32_t numLUIDs, uint32_t index) {
++    return enumMonitors(index);
++  }
++
++
++  bool AndroidWsiDriver::getDisplayName(
++          HMONITOR         hMonitor,
++          WCHAR            (&Name)[32]) {
++    if (fromHmonitor(hMonitor) != 0)
++      return false;
++
++    static const WCHAR s_name[] = L"\\\\.\\DISPLAY1";
++
++    std::memset(Name, 0, sizeof(Name));
++    std::memcpy(Name, s_name, sizeof(s_name));
++
++    return true;
++  }
++
++
++  bool AndroidWsiDriver::getDesktopCoordinates(
++          HMONITOR         hMonitor,
++          RECT*            pRect) {
++    if (fromHmonitor(hMonitor) != 0)
++      return false;
++
++    const auto metrics = androidGetDisplayMetrics();
++
++    pRect->left   = 0;
++    pRect->top    = 0;
++    pRect->right  = LONG(metrics.width);
++    pRect->bottom = LONG(metrics.height);
++
++    return metrics.width && metrics.height;
++  }
++
++
++  static void fillMode(const AndroidDisplayMetrics& metrics, WsiMode* pMode) {
++    pMode->width        = metrics.width;
++    pMode->height       = metrics.height;
++    pMode->refreshRate  = metrics.refreshRate;
++    pMode->bitsPerPixel = metrics.bitsPerPixel;
++    pMode->interlaced   = false;
++  }
++
++
++  bool AndroidWsiDriver::getDisplayMode(
++          HMONITOR         hMonitor,
++          uint32_t         ModeNumber,
++          WsiMode*         pMode) {
++    // Only the current desktop mode is reported; Android does not let an
++    // application enumerate display modes.
++    if (fromHmonitor(hMonitor) != 0 || ModeNumber != 0)
++      return false;
++
++    return getDesktopDisplayMode(hMonitor, pMode);
++  }
++
++
++  bool AndroidWsiDriver::getCurrentDisplayMode(
++          HMONITOR         hMonitor,
++          WsiMode*         pMode) {
++    return getDesktopDisplayMode(hMonitor, pMode);
++  }
++
++
++  bool AndroidWsiDriver::getDesktopDisplayMode(
++          HMONITOR         hMonitor,
++          WsiMode*         pMode) {
++    if (fromHmonitor(hMonitor) != 0)
++      return false;
++
++    const auto metrics = androidGetDisplayMetrics();
++
++    if (!metrics.width || !metrics.height)
++      return false;
++
++    fillMode(metrics, pMode);
++    return true;
++  }
++
++
++  WsiEdidData AndroidWsiDriver::getMonitorEdid(HMONITOR hMonitor) {
++    // No EDID is available through the NDK. DXVK treats an empty EDID as
++    // "unknown monitor" and falls back to its own HDR heuristics.
++    Logger::warn("Android WSI: getMonitorEdid is not available on this platform.");
++    return {};
++  }
++
++}
++
++#endif
+diff --git a/src/wsi/android/wsi_platform_android.cpp b/src/wsi/android/wsi_platform_android.cpp
+new file mode 100644
+index 0000000..cbc9493
+--- /dev/null
++++ b/src/wsi/android/wsi_platform_android.cpp
+@@ -0,0 +1,95 @@
++#if defined(DXVK_WSI_ANDROID)
++
++#include "wsi_platform_android.h"
++
++#include "../../util/util_error.h"
++#include "../../util/util_string.h"
++#include "../../util/log/log.h"
++
++#include <android/native_window.h>
++
++namespace dxvk::wsi {
++
++  static AndroidDisplayMetrics s_displayMetrics;
++
++  AndroidDisplayMetrics androidGetDisplayMetrics() {
++    return s_displayMetrics;
++  }
++
++  void androidSetDisplayMetrics(
++          uint32_t width,
++          uint32_t height,
++          uint32_t refreshNumerator,
++          uint32_t refreshDenominator) {
++    s_displayMetrics.width  = width;
++    s_displayMetrics.height = height;
++
++    if (refreshNumerator && refreshDenominator) {
++      s_displayMetrics.refreshRate = WsiRational {
++        refreshNumerator, refreshDenominator };
++    }
++  }
++
++  // Called by the window functions as soon as a real ANativeWindow shows up,
++  // so that monitor queries report the actual surface size instead of zero.
++  void androidUpdateDisplayMetricsFromWindow(ANativeWindow* pWindow) {
++    if (!pWindow || s_displayMetrics.width)
++      return;
++
++    int32_t w = ANativeWindow_getWidth(pWindow);
++    int32_t h = ANativeWindow_getHeight(pWindow);
++
++    if (w > 0 && h > 0) {
++      s_displayMetrics.width  = uint32_t(w);
++      s_displayMetrics.height = uint32_t(h);
++    }
++  }
++
++  AndroidWsiDriver::AndroidWsiDriver() {
++#if defined(DXVK_WSI_HEADLESS)
++    Logger::info("Android WSI (headless host build): using VK_EXT_headless_surface");
++#else
++    Logger::info("Android WSI: using ANativeWindow surfaces via vkCreateAndroidSurfaceKHR");
++#endif
++  }
++
++  AndroidWsiDriver::~AndroidWsiDriver() { }
++
++  std::vector<const char *> AndroidWsiDriver::getInstanceExtensions() {
++#if defined(DXVK_WSI_HEADLESS)
++    return { VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME };
++#else
++    return { VK_KHR_ANDROID_SURFACE_EXTENSION_NAME };
++#endif
++  }
++
++  static bool createAndroidWsiDriver(WsiDriver **driver) {
++    try {
++      *driver = new AndroidWsiDriver();
++    } catch (const DxvkError& e) {
++      Logger::err(str::format(e.message()));
++      return false;
++    }
++    return true;
++  }
++
++  WsiBootstrap AndroidWSI = {
++    "Android",
++    createAndroidWsiDriver
++  };
++
++}
++
++// Stable C entry point for the embedding application (our Android guest
++// runtime). Exported from libdxvk_d3d11.so / libdxvk_dxgi.so through the
++// version scripts.
++extern "C" void dxvk_android_wsi_set_display_metrics(
++        uint32_t width,
++        uint32_t height,
++        uint32_t refreshNumerator,
++        uint32_t refreshDenominator) {
++  dxvk::wsi::androidSetDisplayMetrics(
++    width, height, refreshNumerator, refreshDenominator);
++}
++
++#endif
+diff --git a/src/wsi/android/wsi_platform_android.h b/src/wsi/android/wsi_platform_android.h
+new file mode 100644
+index 0000000..708d5c7
+--- /dev/null
++++ b/src/wsi/android/wsi_platform_android.h
+@@ -0,0 +1,125 @@
++#pragma once
++
++#include "../wsi_platform.h"
++
++namespace dxvk::wsi {
++
++  /**
++   * \brief Display metrics reported to D3D/DXGI
++   *
++   * Android has no portable refresh-rate query below API level 30, so the
++   * refresh rate defaults to 60/1 - the same fallback DXVK's SDL3 backend uses
++   * when the platform reports nothing (see wsi_platform_sdl3.h, convertMode).
++   * Width/height are filled in from the first ANativeWindow the driver sees
++   * and can be overridden explicitly by the embedding application.
++   */
++  struct AndroidDisplayMetrics {
++    uint32_t    width        = 0;
++    uint32_t    height       = 0;
++    WsiRational refreshRate  = { 60, 1 };
++    uint32_t    bitsPerPixel = 32;
++  };
++
++  AndroidDisplayMetrics androidGetDisplayMetrics();
++
++  class AndroidWsiDriver : public WsiDriver {
++  public:
++    AndroidWsiDriver();
++    ~AndroidWsiDriver();
++
++    // Platform
++    virtual std::vector<const char *> getInstanceExtensions();
++
++    // Monitor
++    virtual HMONITOR getDefaultMonitor();
++
++    virtual HMONITOR enumMonitors(uint32_t index);
++
++    virtual HMONITOR enumMonitors(const LUID *adapterLUID[], uint32_t numLUIDs, uint32_t index);
++
++    virtual bool getDisplayName(
++            HMONITOR         hMonitor,
++            WCHAR            (&Name)[32]);
++
++    virtual bool getDesktopCoordinates(
++            HMONITOR         hMonitor,
++            RECT*            pRect);
++
++    virtual bool getDisplayMode(
++            HMONITOR         hMonitor,
++            uint32_t         modeNumber,
++            WsiMode*         pMode);
++
++    virtual bool getCurrentDisplayMode(
++            HMONITOR         hMonitor,
++            WsiMode*         pMode);
++
++    virtual bool getDesktopDisplayMode(
++            HMONITOR         hMonitor,
++            WsiMode*         pMode);
++
++    virtual WsiEdidData getMonitorEdid(HMONITOR hMonitor);
++
++    // Window
++
++    virtual void getWindowSize(
++            HWND      hWindow,
++            uint32_t* pWidth,
++            uint32_t* pWeight);
++
++    virtual void resizeWindow(
++            HWND             hWindow,
++            DxvkWindowState* pState,
++            uint32_t         width,
++            uint32_t         weight);
++
++    virtual void saveWindowState(
++            HWND             hWindow,
++            DxvkWindowState* pState,
++            bool             saveStyle);
++
++    virtual void restoreWindowState(
++            HWND             hWindow,
++            DxvkWindowState* pState,
++            bool             restoreCoordinates);
++
++    virtual bool setWindowMode(
++            HMONITOR         hMonitor,
++            HWND             hWindow,
++            DxvkWindowState* pState,
++      const WsiMode&         mode);
++
++    virtual bool enterFullscreenMode(
++            HMONITOR         hMonitor,
++            HWND             hWindow,
++            DxvkWindowState* pState,
++            [[maybe_unused]]
++            bool             modeSwitch);
++
++    virtual bool leaveFullscreenMode(
++            HWND             hWindow,
++            DxvkWindowState* pState);
++
++    virtual bool restoreDisplayMode();
++
++    virtual HMONITOR getWindowMonitor(HWND hWindow);
++
++    virtual bool isWindow(HWND hWindow);
++
++    virtual bool isMinimized(HWND hWindow);
++
++    virtual bool isOccluded(HWND hWindow);
++
++    virtual void updateFullscreenWindow(
++            HMONITOR hMonitor,
++            HWND     hWindow,
++            bool     forceTopmost);
++
++    virtual VkResult createSurface(
++            HWND                hWindow,
++            PFN_vkGetInstanceProcAddr pfnVkGetInstanceProcAddr,
++            VkInstance          instance,
++            VkSurfaceKHR*       pSurface);
++  };
++
++}
+diff --git a/src/wsi/android/wsi_window_android.cpp b/src/wsi/android/wsi_window_android.cpp
+new file mode 100644
+index 0000000..6101d7e
+--- /dev/null
++++ b/src/wsi/android/wsi_window_android.cpp
+@@ -0,0 +1,211 @@
++#if defined(DXVK_WSI_ANDROID)
++
++#include "../wsi_window.h"
++
++#include "native/wsi/native_android.h"
++#include "wsi_platform_android.h"
++
++#include "../../util/util_string.h"
++#include "../../util/log/log.h"
++
++#include <windows.h>
++#include <android/native_window.h>
++
++namespace dxvk::wsi {
++
++  // Defined in wsi_platform_android.cpp.
++  void androidUpdateDisplayMetricsFromWindow(ANativeWindow* pWindow);
++
++  void AndroidWsiDriver::getWindowSize(
++        HWND      hWindow,
++        uint32_t* pWidth,
++        uint32_t* pHeight) {
++    ANativeWindow* window = fromHwnd(hWindow);
++
++    if (!window) {
++      Logger::err("Android WSI: getWindowSize: null window");
++      return;
++    }
++
++    androidUpdateDisplayMetricsFromWindow(window);
++
++    int32_t w = ANativeWindow_getWidth(window);
++    int32_t h = ANativeWindow_getHeight(window);
++
++    if (w < 0 || h < 0) {
++      Logger::err(str::format("Android WSI: getWindowSize: ANativeWindow_getWidth/Height failed"));
++      return;
++    }
++
++    if (pWidth)
++      *pWidth = uint32_t(w);
++
++    if (pHeight)
++      *pHeight = uint32_t(h);
++  }
++
++
++  void AndroidWsiDriver::resizeWindow(
++          HWND             hWindow,
++          DxvkWindowState* pState,
++          uint32_t         Width,
++          uint32_t         Height) {
++    ANativeWindow* window = fromHwnd(hWindow);
++
++    if (!window) {
++      Logger::err("Android WSI: resizeWindow: null window");
++      return;
++    }
++
++    // Format 0 keeps the current buffer format.
++    if (ANativeWindow_setBuffersGeometry(window, int32_t(Width), int32_t(Height), 0) != 0)
++      Logger::err(str::format("Android WSI: ANativeWindow_setBuffersGeometry(",
++        Width, "x", Height, ") failed"));
++  }
++
++
++  void AndroidWsiDriver::saveWindowState(
++            HWND             hWindow,
++            DxvkWindowState* pState,
++            bool             saveStyle) {
++    // The Android window/surface is owned by the Activity; there is no window
++    // style or geometry that DXVK could save or restore.
++  }
++
++
++  void AndroidWsiDriver::restoreWindowState(
++            HWND             hWindow,
++            DxvkWindowState* pState,
++            bool             restoreCoordinates) {
++    // Nothing to restore, see saveWindowState.
++  }
++
++
++  bool AndroidWsiDriver::setWindowMode(
++          HMONITOR         hMonitor,
++          HWND             hWindow,
++          DxvkWindowState* pState,
++    const WsiMode&         pMode) {
++    if (fromHmonitor(hMonitor) < 0)
++      return false;
++
++    pState->android.fullscreenMode = pMode;
++    return true;
++  }
++
++
++  bool AndroidWsiDriver::enterFullscreenMode(
++          HMONITOR         hMonitor,
++          HWND             hWindow,
++          DxvkWindowState* pState,
++          bool             ModeSwitch) {
++    // Android applications are always fullscreen; there is no display mode
++    // switch to perform and no window geometry to change.
++    return fromHmonitor(hMonitor) >= 0;
++  }
++
++
++  bool AndroidWsiDriver::leaveFullscreenMode(
++          HWND             hWindow,
++          DxvkWindowState* pState) {
++    return true;
++  }
++
++
++  bool AndroidWsiDriver::restoreDisplayMode() {
++    return true;
++  }
++
++
++  HMONITOR AndroidWsiDriver::getWindowMonitor(HWND hWindow) {
++    return fromHwnd(hWindow) ? toHmonitor(0) : nullptr;
++  }
++
++
++  bool AndroidWsiDriver::isWindow(HWND hWindow) {
++    return fromHwnd(hWindow) != nullptr;
++  }
++
++
++  bool AndroidWsiDriver::isMinimized(HWND hWindow) {
++    // Android has no "minimized" state that would be visible here; a
++    // destroyed surface shows up as a null window instead.
++    return false;
++  }
++
++
++  bool AndroidWsiDriver::isOccluded(HWND hWindow) {
++    return false;
++  }
++
++
++  void AndroidWsiDriver::updateFullscreenWindow(
++          HMONITOR hMonitor,
++          HWND     hWindow,
++          bool     forceTopmost) {
++    // Nothing to do, see enterFullscreenMode.
++  }
++
++
++  VkResult AndroidWsiDriver::createSurface(
++          HWND                      hWindow,
++          PFN_vkGetInstanceProcAddr pfnVkGetInstanceProcAddr,
++          VkInstance                instance,
++          VkSurfaceKHR*             pSurface) {
++    ANativeWindow* window = fromHwnd(hWindow);
++
++    if (!window) {
++      Logger::err("Android WSI: createSurface: null window");
++      return VK_ERROR_INITIALIZATION_FAILED;
++    }
++
++    if (!pfnVkGetInstanceProcAddr) {
++      Logger::err("Android WSI: createSurface: no vkGetInstanceProcAddr");
++      return VK_ERROR_INITIALIZATION_FAILED;
++    }
++
++#if defined(DXVK_WSI_HEADLESS)
++    auto pfnCreateHeadlessSurface = reinterpret_cast<PFN_vkCreateHeadlessSurfaceEXT>(
++      pfnVkGetInstanceProcAddr(instance, "vkCreateHeadlessSurfaceEXT"));
++
++    if (!pfnCreateHeadlessSurface) {
++      Logger::err("Android WSI (headless): vkCreateHeadlessSurfaceEXT not available");
++      return VK_ERROR_EXTENSION_NOT_PRESENT;
++    }
++
++    androidUpdateDisplayMetricsFromWindow(window);
++
++    VkHeadlessSurfaceCreateInfoEXT headlessInfo = { VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT };
++    VkResult headlessResult = pfnCreateHeadlessSurface(instance, &headlessInfo, nullptr, pSurface);
++
++    if (headlessResult != VK_SUCCESS)
++      Logger::err(str::format("Android WSI (headless): vkCreateHeadlessSurfaceEXT failed: ", headlessResult));
++
++    return headlessResult;
++#else
++    auto pfnCreateAndroidSurface = reinterpret_cast<PFN_vkCreateAndroidSurfaceKHR>(
++      pfnVkGetInstanceProcAddr(instance, "vkCreateAndroidSurfaceKHR"));
++
++    if (!pfnCreateAndroidSurface) {
++      Logger::err("Android WSI: vkCreateAndroidSurfaceKHR not available");
++      return VK_ERROR_EXTENSION_NOT_PRESENT;
++    }
++
++    androidUpdateDisplayMetricsFromWindow(window);
++
++    VkAndroidSurfaceCreateInfoKHR info = { VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR };
++    info.flags  = 0;
++    info.window = window;
++
++    VkResult result = pfnCreateAndroidSurface(instance, &info, nullptr, pSurface);
++
++    if (result != VK_SUCCESS)
++      Logger::err(str::format("Android WSI: vkCreateAndroidSurfaceKHR failed: ", result));
++
++    return result;
++#endif
++  }
++
++}
++
++#endif
+diff --git a/src/wsi/meson.build b/src/wsi/meson.build
+index 1d88e2c..05058cb 100644
+--- a/src/wsi/meson.build
++++ b/src/wsi/meson.build
+@@ -13,6 +13,9 @@ wsi_src = [
+   'glfw/wsi_monitor_glfw.cpp',
+   'glfw/wsi_platform_glfw.cpp',
+   'glfw/wsi_window_glfw.cpp',
++  'android/wsi_monitor_android.cpp',
++  'android/wsi_platform_android.cpp',
++  'android/wsi_window_android.cpp',
+ ]
+ 
+ wsi_deps = [ dep_displayinfo ]
+@@ -20,6 +23,11 @@ wsi_deps = [ dep_displayinfo ]
+ if platform == 'windows'
+   lib_setupapi = cpp.find_library('setupapi')
+   wsi_deps += [ lib_setupapi ]
++elif headless_wsi
++  # ANativeWindow is the header-only stand-in from include/native/headless.
++elif platform == 'android'
++  # ANativeWindow / AConfiguration come from the NDK's libandroid.
++  wsi_deps += [ cpp.find_library('android') ]
+ else
+   wsi_deps += [
+     lib_sdl3.partial_dependency(compile_args: true, includes: true),
+diff --git a/src/wsi/wsi_platform.cpp b/src/wsi/wsi_platform.cpp
+index 08f456e..a12fa76 100644
+--- a/src/wsi/wsi_platform.cpp
++++ b/src/wsi/wsi_platform.cpp
+@@ -20,6 +20,9 @@ namespace dxvk::wsi {
+ #endif
+ #if defined(DXVK_WSI_GLFW)
+     &GlfwWSI,
++#endif
++#if defined(DXVK_WSI_ANDROID)
++    &AndroidWSI,
+ #endif
+   };
+ 
+diff --git a/src/wsi/wsi_platform.h b/src/wsi/wsi_platform.h
+index f1fae3f..97433d7 100644
+--- a/src/wsi/wsi_platform.h
++++ b/src/wsi/wsi_platform.h
+@@ -123,6 +123,9 @@ namespace dxvk::wsi {
+ #if defined(DXVK_WSI_GLFW)
+   extern WsiBootstrap GlfwWSI;
+ #endif
++#if defined(DXVK_WSI_ANDROID)
++  extern WsiBootstrap AndroidWSI;
++#endif
+ 
+   void init();
+   void quit();
+diff --git a/src/wsi/wsi_window.h b/src/wsi/wsi_window.h
+index 085a437..af753c8 100644
+--- a/src/wsi/wsi_window.h
++++ b/src/wsi/wsi_window.h
+@@ -29,6 +29,11 @@ namespace dxvk::wsi {
+ #endif
+ #if defined(DXVK_WSI_GLFW)
+     // Nothing to store
++#endif
++#if defined(DXVK_WSI_ANDROID)
++    struct {
++      WsiMode fullscreenMode = { };
++    } android;
+ #endif
+   };
+ 
+diff --git a/subprojects/.wraplock b/subprojects/.wraplock
+new file mode 100644
+index 0000000..e69de29
